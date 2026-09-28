@@ -225,9 +225,9 @@
 //! tokens, and persistent entries carry their own extensible TTL so a
 //! long-idle balance does not silently expire the way archived instance
 //! storage would force a full-state restore. Every balance write bumps the
-//! entry's TTL with the standard threshold/extend pattern, and `touch_ttl`
-//! is a permissionless keeper entrypoint for balances that sit idle near
-//! expiry.
+//! entry's TTL with the standard threshold/extend pattern — the shared
+//! `soroban_forge_shared_utils::ttl` policy — and `touch_ttl` is a
+//! permissionless keeper entrypoint for balances that sit idle near expiry.
 //!
 //! Transaction records (`DataKey::Tx(tx_id)`) migrated to **persistent
 //! storage** for the same reason: instance storage is byte-budgeted as one
@@ -262,26 +262,11 @@ compile_error!(
 #[cfg(test)]
 extern crate std;
 
-use soroban_forge_shared_utils::ForgeError;
+use soroban_forge_shared_utils::{bump_entry, ForgeError};
 use soroban_sdk::{
     contract, contractclient, contractevent, contractimpl, contracttype, token, Address, Bytes,
     Env, IntoVal, Symbol, Val, Vec,
 };
-
-/// Ledger-time constants for TTL bumps.
-///
-/// One ledger closes roughly every 5 seconds, so 17,280 ledgers ≈ 1 day.
-/// `BUMP_AMOUNT` is the lifetime written on every touch; `BUMP_THRESHOLD`
-/// is how close to expiry an entry must be before a bump applies. The
-/// 30-day horizon comfortably covers an idle custody balance between keeper
-/// touches.
-mod ttl {
-    pub const DAY_IN_LEDGERS: u32 = 17_280;
-    /// Lifetime applied on every TTL touch.
-    pub const BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
-    /// Bump only when the entry is within this window of expiring.
-    pub const BUMP_THRESHOLD: u32 = BUMP_AMOUNT - DAY_IN_LEDGERS;
-}
 
 /// Public interface for the Soroban Forge multi-signature wallet contract.
 #[contractclient(name = "SorobanForgeMultiSigWalletClient")]
@@ -1875,15 +1860,6 @@ fn transfer_from_contract(
         Ok(Ok(())) => Ok(()),
         _ => Err(ForgeError::TokenTransferFailed),
     }
-}
-
-/// Bump a persistent entry's TTL to the [`ttl::BUMP_AMOUNT`] horizon when
-/// it falls inside [`ttl::BUMP_THRESHOLD`]. The standard threshold/extend
-/// pattern: cheap no-op while the entry is fresh, decisive near expiry.
-fn bump_entry(env: &Env, key: &DataKey) {
-    env.storage()
-        .persistent()
-        .extend_ttl(key, ttl::BUMP_THRESHOLD, ttl::BUMP_AMOUNT);
 }
 
 /// Lifecycle events. The tx id is a **topic** so indexers can filter

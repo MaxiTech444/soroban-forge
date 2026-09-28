@@ -15,6 +15,9 @@ fn get_tranche_schedule(schedule_id) -> Result<TrancheSchedule, ForgeError>
 fn claim(schedule_id) -> Result<i128, ForgeError>
 fn claimable(schedule_id) -> Result<i128, ForgeError>
 fn get_status(schedule_id) -> Result<VestingStatus, ForgeError>
+// record views
+fn get_schedule(schedule_id) -> Result<VestingSchedule, ForgeError>
+fn get_tranche_schedule(schedule_id) -> Result<TrancheSchedule, ForgeError>
 ```
 
 `Tranche { unlock_at: u64, amount: i128 }` is one entry of the unlock table:
@@ -102,7 +105,22 @@ revocation method.
 
 - `create_schedule` and `create_tranche_schedule` require the beneficiary.
 - `claim` requires the beneficiary.
-- `claimable`, `get_status`, and `get_tranche_schedule` are read-only views.
+- `claimable`, `get_status`, `get_schedule`, and `get_tranche_schedule` are
+  read-only views.
+
+### Record views
+
+`get_schedule` returns the complete stored **linear** record — beneficiary,
+token, `total_amount`, `start`, `cliff`, `duration`, `claimed`, and the
+status as of the last write — so a beneficiary dashboard or an auditor can
+fetch the schedule on-chain instead of reconstructing it from the
+`create_schedule` invocation. It mirrors `get_proposal` (DAO governance) and
+`get_subscription` (subscription payments): same `Result` shape, same
+`NotFound` mapping, no `require_auth`, no state change. The view reads the
+same record `claim`/`claimable` read, so `claimed` includes every completed
+claim. Unknown ids — and tranche ids, which live under their own `DataKey`
+variant — return `ForgeError::NotFound`; tranche records are read via
+`get_tranche_schedule`.
 
 ## Settlement
 
