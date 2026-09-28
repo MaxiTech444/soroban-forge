@@ -69,8 +69,8 @@
 //! Authorization model:
 //! - `create_schedule` and `create_tranche_schedule` require the beneficiary.
 //! - `claim` requires the beneficiary.
-//! - `claimable`, `get_status`, and `get_tranche_schedule` are read-only
-//!   views.
+//! - `claimable`, `get_status`, `get_schedule`, and `get_tranche_schedule`
+//!   are read-only views.
 //!
 //! ## Settlement (load-bearing)
 //!
@@ -154,12 +154,32 @@ pub trait SorobanForgeVesting {
     /// Read the full tranche schedule record, immutable unlock table included
     /// (read-only view).
     ///
-    /// The record-view counterpart of `get_schedule` (proposed for the linear
-    /// kind in issue #125); a linear id is `NotFound` here, and vice versa.
+    /// The tranche counterpart of [`get_schedule`](Self::get_schedule); a
+    /// linear id is `NotFound` here, and vice versa.
     fn get_tranche_schedule(
         env: Env,
         schedule_id: u64,
     ) -> Result<TrancheSchedule, soroban_forge_shared_utils::ForgeError>;
+
+    /// Read the full linear schedule record (read-only view).
+    ///
+    /// Returns the stored [`VestingSchedule`] — beneficiary, token,
+    /// `total_amount`, `start`, `cliff`, `duration`, `claimed`, and the
+    /// status as of the last write — for integrators and auditors, matching
+    /// the workspace's record-view convention (`get_proposal`,
+    /// `get_subscription`, `get_tx`). The view reads the same record
+    /// `claim`/`claimable` read, so `claimed` reflects every completed
+    /// claim. Requires no authorization and writes nothing. A tranche id is
+    /// `NotFound` here; use
+    /// [`get_tranche_schedule`](Self::get_tranche_schedule) for those.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no linear schedule with this id.
+    fn get_schedule(
+        env: Env,
+        schedule_id: u64,
+    ) -> Result<VestingSchedule, soroban_forge_shared_utils::ForgeError>;
 
     /// Claim tokens that have vested as of the current ledger time.
     ///
@@ -390,6 +410,23 @@ impl Vesting {
         env.storage()
             .instance()
             .get(&DataKey::TrancheSchedule(schedule_id))
+            .ok_or(ForgeError::NotFound)
+    }
+
+    /// Read the full linear schedule record (read-only view; no state
+    /// change, no authorization).
+    ///
+    /// Mirrors `get_proposal` in the DAO contract and `get_subscription` in
+    /// the subscription contract — same `Result` shape, same `NotFound`
+    /// mapping — so a beneficiary's dashboard or an auditor can fetch the
+    /// stored record on-chain instead of reconstructing it from the
+    /// `create_schedule` invocation. The record read here is the same one
+    /// `claim`/`claimable` read, so `claimed` includes every completed
+    /// claim.
+    pub fn get_schedule(env: Env, schedule_id: u64) -> Result<VestingSchedule, ForgeError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Schedule(schedule_id))
             .ok_or(ForgeError::NotFound)
     }
 

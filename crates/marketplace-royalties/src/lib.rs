@@ -33,6 +33,8 @@
 //! ```
 //!
 //! Authorization model:
+//! - `quote_sale` is a pure read-only derivation over the stored config: no
+//!   auth, no storage write, no event.
 //! - `set_royalty` requires the collection (the contract whose config this
 //!   is), and `bps` must not exceed 100% (10_000 bps).
 //! - `distribute` requires the collection (as `settle_sale` does) and the
@@ -164,6 +166,33 @@ pub trait SorobanForgeMarketplaceRoyalties {
         collection: Address,
     ) -> Result<SettlementSummary, soroban_forge_shared_utils::ForgeError>;
 
+    /// Quote the exact split a settlement of `amount` for `collection`
+    /// would apply, without moving tokens, touching storage, requiring
+    /// authorization, or emitting events (read-only view).
+    ///
+    /// Parity guarantee: the quote runs the same `effective_bps` resolution
+    /// and the same `split` math the settlement paths run, so `royalty_amount`
+    /// and `seller_net` equal what `settle_sale`/`settle_sales`/`distribute`
+    /// would produce for the same configuration and amount — floor rounding
+    /// included — and `royalty_amount + seller_net == gross` exactly. The
+    /// quote **never succeeds** where a settlement would fail: an
+    /// unregistered collection returns the settlement paths' `NotFound`, a
+    /// disabled configuration quotes a zero royalty share exactly as those
+    /// paths settle in full to the seller, and `amount <= 0` returns the
+    /// same `InvalidInput` validation error `distribute`/`settle_sale`
+    /// return.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no royalty configuration for this
+    ///   collection.
+    /// * [`ForgeError::InvalidInput`] — `amount <= 0`.
+    fn quote_sale(
+        env: Env,
+        collection: Address,
+        amount: i128,
+    ) -> Result<SaleQuote, soroban_forge_shared_utils::ForgeError>;
+
     /// Permissionless keeper entrypoint: extend the persistent storage TTL of a collection's royalty configuration and settlement summary.
     ///
     /// # Errors
@@ -221,6 +250,31 @@ pub struct SettlementSummary {
     pub gross_volume: i128,
     /// Sum of every royalty share transferred to the recipient.
     pub royalties_paid: i128,
+}
+
+/// The exact split one sale of `collection` would settle at, as returned by
+/// [`quote_sale`](SorobanForgeMarketplaceRoyalties::quote_sale).
+///
+/// Flat, like [`Settlement`] and [`SettlementSummary`]: the per-sale
+/// counterpart of the cumulative summary, shaped for pre-sale display
+/// ("you pay `gross`, the creator receives `royalty_amount`, the seller
+/// receives `seller_net`") without re-deriving the basis-point math
+/// off-chain.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SaleQuote {
+    /// The sale amount quoted (echoed back as `gross`).
+    pub gross: i128,
+    /// The basis-point rate actually applied, after the config's status —
+    /// zero for a `Disabled` configuration, exactly what the settlement
+    /// paths apply.
+    pub royalty_bps: u32,
+    /// The royalty share the settlement would pay the configured recipient:
+    /// `gross * royalty_bps / 10_000`, floored, the settlement's own math.
+    pub royalty_amount: i128,
+    /// The seller's net: `gross - royalty_amount`, so the two always sum
+    /// exactly to `gross` (rounding dust stays with the seller).
+    pub seller_net: i128,
 }
 
 /// Persistent storage TTL constants.
@@ -551,6 +605,41 @@ impl MarketplaceRoyalties {
             .persistent()
             .get(&DataKey::Summary(collection))
             .ok_or(ForgeError::NotFound)
+    }
+
+    /// Quote the split a settlement of `amount` for `collection` would
+    /// apply (read-only view; no auth, no storage write, no event).
+    ///
+    /// Reads the same stored configuration the settlement paths read and
+    /// routes through the same [`effective_bps`] + [`split`] helpers they
+    /// call — the quote never re-derives the math — so the returned
+    /// [`SaleQuote`] is exactly what `settle_sale`/`settle_sales`/
+    /// `distribute` would produce for this configuration and amount. Error
+    /// parity: unregistered collections return the settlements'
+    /// [`ForgeError::NotFound`], and `amount <= 0` returns the same
+    /// [`ForgeError::InvalidInput`] those entrypoints validate with.
+    pub fn quote_sale(
+        env: Env,
+        collection: Address,
+        amount: i128,
+    ) -> Result<SaleQuote, ForgeError> {
+        if amount <= 0 {
+            return Err(ForgeError::InvalidInput);
+        }
+        let royalty: Royalty = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Royalty(collection))
+            .ok_or(ForgeError::NotFound)?;
+
+        let royalty_bps = effective_bps(&royalty);
+        let (royalty_amount, seller_net) = split(amount, royalty_bps)?;
+        Ok(SaleQuote {
+            gross: amount,
+            royalty_bps,
+            royalty_amount,
+            seller_net,
+        })
     }
 
     /// Permissionless keeper: bump the royalty and summary entries' TTL without changing
@@ -1243,6 +1332,168 @@ mod tests {
             ForgeError::NotFound,
             "no settlement state is committed on failure"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // quote_sale — the read-only pre-sale view (issue #126)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn quote_sale_matches_settle_sale_exactly() {
+        let (env, token, tc, _contract_id, client, accounts) = setup_settlement!();
+        let payer = &accounts.user1;
+        let seller = &accounts.user3;
+        let collection = &accounts.arbiter;
+
+        // The quote for a 1_000 sale under the fixture's 500-bps config.
+        let quote = client.quote_sale(collection, &1_000_i128);
+        assert_eq!(quote.gross, 1_000);
+        assert_eq!(quote.royalty_bps, 500);
+        assert_eq!(quote.royalty_amount, 50);
+        assert_eq!(quote.seller_net, 950);
+        assert_eq!(quote.royalty_amount + quote.seller_net, quote.gross);
+
+        // Settling the same sale produces exactly the quoted split — the
+        // parity guarantee — and the quote moved no balances.
+        let settled = client.settle_sale(collection, &token, payer, seller, &1_000_i128);
+        assert_eq!(settled.royalty_share, quote.royalty_amount);
+        assert_eq!(settled.seller_net, quote.seller_net);
+        assert_eq!(tc.balance(payer), 0, "the quote itself never moves tokens");
+        let _ = env;
+    }
+
+    #[test]
+    fn quote_sale_covers_bps_boundaries_and_rounding() {
+        let (_env, _token, _tc, _contract_id, client, accounts) = setup_settlement!();
+        let recipient = &accounts.user2;
+        let collection = &accounts.arbiter;
+
+        // Zero bps: everything to the seller.
+        client.set_royalty(collection, recipient, &0_u32);
+        let quote = client.quote_sale(collection, &1_000_i128);
+        assert_eq!(quote.royalty_bps, 0);
+        assert_eq!(quote.royalty_amount, 0);
+        assert_eq!(quote.seller_net, 1_000);
+        assert_eq!(quote.royalty_amount + quote.seller_net, quote.gross);
+
+        // Max bps: everything to the recipient.
+        client.set_royalty(collection, recipient, &10_000_u32);
+        let quote = client.quote_sale(collection, &1_000_i128);
+        assert_eq!(quote.royalty_bps, 10_000);
+        assert_eq!(quote.royalty_amount, 1_000);
+        assert_eq!(quote.seller_net, 0);
+        assert_eq!(quote.royalty_amount + quote.seller_net, quote.gross);
+
+        // A floor-rounding remainder: 5% of 19 is 0.95, which floors to a
+        // zero royalty share with the whole sale to the seller; 5% of 1_999
+        // is 99.95, which floors to 99 with the dust staying with the
+        // seller. Sum invariant holds in every case.
+        client.set_royalty(collection, recipient, &500_u32);
+        let quote = client.quote_sale(collection, &19_i128);
+        assert_eq!(quote.royalty_amount, 0);
+        assert_eq!(quote.seller_net, 19);
+        let quote = client.quote_sale(collection, &1_999_i128);
+        assert_eq!(quote.royalty_amount, 99);
+        assert_eq!(quote.seller_net, 1_900);
+        assert_eq!(quote.royalty_amount + quote.seller_net, quote.gross);
+    }
+
+    #[test]
+    fn quote_sale_rejects_non_positive_amount() {
+        let (_env, _token, _tc, _contract_id, client, accounts) = setup_settlement!();
+        let collection = &accounts.arbiter;
+
+        for amount in [0_i128, -100] {
+            let err = client
+                .try_quote_sale(collection, &amount)
+                .unwrap_err()
+                .unwrap();
+            assert_eq!(err, ForgeError::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn quote_sale_unregistered_collection_is_not_found() {
+        let (_env, _token, _tc, _contract_id, client, accounts) = setup_settlement!();
+        // A collection with no config fails the quote exactly as the
+        // settlement paths would.
+        let err = client
+            .try_quote_sale(&accounts.validator, &1_000_i128)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::NotFound);
+    }
+
+    #[test]
+    fn quote_sale_disabled_config_quotes_a_zero_share_like_settlement() {
+        let (env, token, tc, contract_id, client, accounts) = setup_settlement!();
+        let payer = &accounts.user1;
+        let recipient = &accounts.user2;
+        let seller = &accounts.user3;
+        let collection = &accounts.arbiter;
+
+        // `set_royalty` has no public "disable" switch (it always stores
+        // `Active`), so write the `Disabled` record directly — the same
+        // fixture the settle suite uses.
+        let disabled = Royalty {
+            collection: collection.clone(),
+            recipient: recipient.clone(),
+            bps: 500,
+            status: RoyaltyStatus::Disabled,
+        };
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Royalty(collection.clone()), &disabled);
+        });
+
+        // The quote reports the effective zero bps and full seller net —
+        // never a success that settlement would contradict.
+        let quote = client.quote_sale(collection, &1_000_i128);
+        assert_eq!(quote.royalty_bps, 0);
+        assert_eq!(quote.royalty_amount, 0);
+        assert_eq!(quote.seller_net, 1_000);
+
+        // And settling the same sale settles exactly that.
+        let settled = client.settle_sale(collection, &token, payer, seller, &1_000_i128);
+        assert_eq!(settled.royalty_share, quote.royalty_amount);
+        assert_eq!(settled.seller_net, quote.seller_net);
+        assert_eq!(tc.balance(recipient), 0);
+    }
+
+    #[test]
+    fn quote_sale_is_read_only_and_needs_no_authorization() {
+        let (env, token, _tc, contract_id, client, accounts) = setup_settlement!();
+        let collection = &accounts.arbiter;
+
+        let before = client.quote_sale(collection, &1_000_i128);
+
+        // Empty auth set: the host proves the quote requires no signature,
+        // so a marketplace UI can quote without a wallet connected.
+        env.set_auths(&[]);
+        let after = client.quote_sale(collection, &1_000_i128);
+
+        assert_eq!(after, before);
+        // No settlement summary materialized from quoting.
+        assert_eq!(
+            client
+                .try_get_settlement_summary(collection)
+                .unwrap_err()
+                .unwrap(),
+            ForgeError::NotFound
+        );
+        // And the quoted sale can still be settled for real afterwards
+        // (authorizations restored for the settlement call).
+        env.mock_all_auths();
+        let settled = client.settle_sale(
+            collection,
+            &token,
+            &accounts.user1,
+            &accounts.user3,
+            &1_000_i128,
+        );
+        assert_eq!(settled.royalty_share, before.royalty_amount);
+        let _ = contract_id;
     }
 
     // -------------------------------------------------------------------

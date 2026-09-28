@@ -258,6 +258,121 @@ fn get_status_missing_schedule_is_not_found() {
     assert_eq!(err, ForgeError::NotFound);
 }
 
+// -------------------------------------------------------------------
+// get_schedule — the linear record view (issue #125)
+// -------------------------------------------------------------------
+
+#[test]
+fn get_schedule_returns_the_full_stored_record() {
+    let (env, token, _tc, _cid, client, accounts) = setup!();
+    let id = create(&client, &token, &accounts);
+
+    let schedule = client.get_schedule(&id);
+    assert_eq!(schedule.beneficiary, accounts.user1);
+    assert_eq!(schedule.token, token);
+    assert_eq!(schedule.total_amount, TOTAL);
+    assert_eq!(schedule.start, START);
+    assert_eq!(schedule.cliff, CLIFF);
+    assert_eq!(schedule.duration, DURATION);
+    assert_eq!(schedule.claimed, 0);
+    assert_eq!(schedule.status, VestingStatus::Locked);
+    assert_eq!(
+        env.ledger().timestamp(),
+        START,
+        "no state change from the view"
+    );
+}
+
+#[test]
+fn get_schedule_unknown_id_is_not_found() {
+    let (_env, _token, _tc, _cid, client, _accounts) = setup!();
+    let err = client.try_get_schedule(&999).unwrap_err().unwrap();
+    assert_eq!(err, ForgeError::NotFound);
+}
+
+#[test]
+fn get_schedule_reflects_completed_claims() {
+    let (env, token, _tc, _cid, client, accounts) = setup!();
+    let id = create(&client, &token, &accounts);
+
+    // Halfway through the window, claim the vested half.
+    env.ledger()
+        .set_timestamp(START + CLIFF + (DURATION - CLIFF) / 2);
+    assert_eq!(client.claim(&id), TOTAL / 2);
+
+    // The view reads the same record `claim` writes: `claimed` advanced.
+    let schedule = client.get_schedule(&id);
+    assert_eq!(schedule.claimed, TOTAL / 2);
+    assert_eq!(schedule.status, VestingStatus::Vesting);
+    // And it still agrees with what `claimable` derives.
+    assert_eq!(client.claimable(&id), 0);
+
+    // A second claim then advances the view again.
+    env.ledger().set_timestamp(START + DURATION + 1);
+    assert_eq!(client.claim(&id), TOTAL - TOTAL / 2);
+    let schedule = client.get_schedule(&id);
+    assert_eq!(schedule.claimed, TOTAL);
+    assert_eq!(schedule.status, VestingStatus::Completed);
+}
+
+#[test]
+fn get_schedule_is_read_only_and_never_errors_for_a_stored_record() {
+    let (env, token, _tc, contract_id, client, accounts) = setup!();
+    let id = create(&client, &token, &accounts);
+
+    let before = client.get_schedule(&id);
+
+    // The view runs without authorizations — as the host proves with an
+    // empty auth set — and leaves the stored record byte-identical.
+    env.set_auths(&[]);
+    let after = client.get_schedule(&id);
+
+    assert_eq!(after.claimed, before.claimed);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.total_amount, before.total_amount);
+    assert_eq!(after.start, before.start);
+    assert_eq!(after.cliff, before.cliff);
+    assert_eq!(after.duration, before.duration);
+    assert_eq!(after.beneficiary, before.beneficiary);
+    assert_eq!(after.token, before.token);
+    // No id was allocated and no counter moved.
+    assert_eq!(
+        client.try_get_schedule(&(id + 1)).unwrap_err().unwrap(),
+        ForgeError::NotFound,
+        "the view must not allocate ids or write state"
+    );
+    let _ = contract_id;
+}
+
+#[test]
+fn get_schedule_is_not_found_for_a_tranche_id() {
+    let (env, token, _tc, _cid, client, accounts) = setup!();
+    // One linear schedule, then one tranche schedule sharing the id space.
+    let linear_id = create(&client, &token, &accounts);
+    let tranches = soroban_sdk::vec![
+        &env,
+        Tranche {
+            unlock_at: 0,
+            amount: TOTAL,
+        }
+    ];
+    let _tranche_id =
+        client.create_tranche_schedule(&accounts.user2, &accounts.validator, &tranches);
+
+    // The linear view maps the tranche id (linear_id + 1) to NotFound; the
+    // tranche view maps the linear id to NotFound in return.
+    let err = client
+        .try_get_schedule(&(linear_id + 1))
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ForgeError::NotFound);
+    let err = client
+        .try_get_tranche_schedule(&linear_id)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ForgeError::NotFound);
+}
+
 #[test]
 fn claimable_overflow_is_reported() {
     let (env, _token, _tc, _cid, client, accounts) = setup!();

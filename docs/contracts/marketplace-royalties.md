@@ -14,8 +14,14 @@ fn settle_sale(collection, token, payer, seller, amount) -> Result<Settlement, F
 fn settle_sales(collection, token, payer, sales: Vec<(seller, amount)>) -> Result<Vec<Settlement>, ForgeError>
 fn get_royalty(collection) -> Result<Royalty, ForgeError>
 fn get_settlement_summary(collection) -> Result<SettlementSummary, ForgeError>
+fn quote_sale(collection, amount) -> Result<SaleQuote, ForgeError>
 fn touch_ttl(collection) -> Result<(), ForgeError>
 ```
+
+`SaleQuote { gross, royalty_bps, royalty_amount, seller_net }` is the
+per-sale counterpart of the cumulative `SettlementSummary`, shaped for
+pre-sale display ("you pay `gross`, the creator receives `royalty_amount`,
+the seller receives `seller_net`").
 
 ## Concepts
 
@@ -59,6 +65,26 @@ and only need the royalty leg settled; a `Disabled` or zero-bps
 configuration transfers nothing and returns the full `amount`. It requires
 the collection's and the payer's authorization, and emits the same
 `SaleSettled` event as the settlement entrypoints.
+
+### Sale quote (settle parity)
+
+`quote_sale(collection, amount)` is a read-only derivation over the stored
+configuration: it returns the exact split a settlement would apply —
+`gross`, the effective `royalty_bps` (after the config's status), the floored
+`royalty_amount`, and `seller_net` — with **no** authorization, storage
+write, token transfer, or event.
+
+The quote never re-derives the math: it routes through the same
+`effective_bps` resolution and the same `split` function the settlement
+paths call, so `royalty_amount` and `seller_net` equal what
+`settle_sale`/`settle_sales`/`distribute` produce for the same configuration
+and amount — floor rounding included — and `royalty_amount + seller_net ==
+gross` exactly. Error parity: an unregistered collection returns the
+settlement paths' `ForgeError::NotFound`, `amount <= 0` returns the same
+`ForgeError::InvalidInput` those entrypoints validate with, and a
+`Disabled` configuration quotes a zero royalty share exactly as the
+settlements settle in full to the seller — the quote **never** succeeds
+where a settlement would fail.
 
 ### Batch settlement
 
